@@ -121,7 +121,7 @@ jobs:
             echo '{"success":false,"message":"Impact analysis API failed after retries"}' > analysis-result.json
           fi
 
-          RISK_LABEL=$(jq -r '.simulation.riskLevel // .simulation.riskScore // .result.riskScore // .impactReport.risk.label // "UNKNOWN"' analysis-result.json)
+          RISK_LABEL=$(jq -r '.impactReport.riskLevel // .simulation.riskLevel // .riskLevel // .impactReport.risk.label // .impactReport.riskScore // .simulation.riskScore // .result.riskScore // "UNKNOWN"' analysis-result.json)
           RISK_UPPER=$(echo "$RISK_LABEL" | tr '[:lower:]' '[:upper:]')
           echo "risk_label=$RISK_LABEL" >> "$GITHUB_OUTPUT"
 
