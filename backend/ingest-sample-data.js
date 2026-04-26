@@ -17,7 +17,16 @@ const log = (msg) => console.log(`[ingest] ${msg}`);
 
 async function getAuthHeaders() {
   if (TOKEN) {
-    return { Authorization: `Bearer ${TOKEN}` };
+    const tokenHeaders = { Authorization: `Bearer ${TOKEN}` };
+    try {
+      await client.get('/api/v1/users/loggedInUser', { headers: tokenHeaders });
+      return tokenHeaders;
+    } catch (error) {
+      if (error.response?.status !== 401) {
+        throw error;
+      }
+      log('Provided OPENMETADATA_TOKEN is invalid. Falling back to admin login.');
+    }
   }
 
   const encodedPassword = Buffer.from(ADMIN_PASSWORD).toString('base64');
@@ -91,6 +100,61 @@ async function upsertSchema(headers, databaseFqn, schemaName) {
   }, { headers });
 
   return schemaFqn;
+}
+
+async function upsertService(headers, serviceCollection, name, serviceType) {
+  const encoded = encodeURIComponent(name);
+  try {
+    const existing = await client.get(`/api/v1/services/${serviceCollection}/name/${encoded}`, { headers });
+    return {
+      id: existing.data.id,
+      fullyQualifiedName: existing.data.fullyQualifiedName
+    };
+  } catch (error) {
+    if (error.response?.status !== 404) {
+      throw error;
+    }
+  }
+
+  await client.post(`/api/v1/services/${serviceCollection}`, {
+    name,
+    serviceType
+  }, { headers });
+
+  const created = await client.get(`/api/v1/services/${serviceCollection}/name/${encoded}`, { headers });
+  return {
+    id: created.data.id,
+    fullyQualifiedName: created.data.fullyQualifiedName
+  };
+}
+
+async function upsertNamedEntity(headers, collection, serviceFqn, payload) {
+  const fqn = `${serviceFqn}.${payload.name}`;
+  const encodedFqn = encodeURIComponent(fqn);
+
+  try {
+    const existing = await client.get(`/api/v1/${collection}/name/${encodedFqn}`, { headers });
+    return existing.data;
+  } catch (error) {
+    if (error.response?.status !== 404) {
+      throw error;
+    }
+  }
+
+  try {
+    const created = await client.post(`/api/v1/${collection}`, {
+      ...payload,
+      service: serviceFqn
+    }, { headers });
+    return created.data;
+  } catch (error) {
+    if (error.response?.status !== 409) {
+      throw error;
+    }
+  }
+
+  const created = await client.get(`/api/v1/${collection}/name/${encodedFqn}`, { headers });
+  return created.data;
 }
 
 async function ingest() {
@@ -176,6 +240,16 @@ async function ingest() {
           { name: 'created_at', dataType: 'TIMESTAMP' }
         ],
         description: 'Operational transient logs table used for low-risk demo scenarios'
+      },
+      {
+        name: 'test_orders_snapshot',
+        databaseSchema: martsSchemaFqn,
+        columns: [
+          { name: 'snapshot_date', dataType: 'DATE' },
+          { name: 'orders_total', dataType: 'INT' },
+          { name: 'revenue_total', dataType: 'DECIMAL' }
+        ],
+        description: 'Test snapshot table for impact analysis validation flows'
       }
     ];
 
@@ -201,16 +275,17 @@ async function ingest() {
 
     // 3. Create Lineage
     log('Step 3: Creating lineage edges...');
-    const edges = [
+    const tableEdges = [
       { from: 'raw_orders',     to: 'orders_cleaned' },
       { from: 'orders_cleaned', to: 'orders_summary'  },
       { from: 'orders_cleaned', to: 'sales_metrics'   },
       { from: 'orders_summary', to: 'sales_metrics'   },
-      { from: 'user_profiles',  to: 'orders_cleaned'  }
+      { from: 'user_profiles',  to: 'orders_cleaned'  },
+      { from: 'orders_summary', to: 'test_orders_snapshot' }
     ];
 
     let edgeCount = 0;
-    for (const edge of edges) {
+    for (const edge of tableEdges) {
       await client.put('/api/v1/lineage', {
         edge: {
           fromEntity: { id: tableIds[edge.from], type: 'table' },
@@ -223,15 +298,95 @@ async function ingest() {
       edgeCount++;
     }
 
-    // 4. Verify
+    // 4. Create test dashboard/pipeline/model entities
+    log('Step 4: Creating dashboard, pipeline, and ML model test assets...');
+
+    const pipelineService = await upsertService(headers, 'pipelineServices', 'impact-demo-pipeline-service', 'Airflow');
+    const dashboardService = await upsertService(headers, 'dashboardServices', 'impact-demo-dashboard-service', 'Superset');
+    const mlModelService = await upsertService(headers, 'mlmodelServices', 'impact-demo-mlmodel-service', 'Mlflow');
+
+    const testPipeline = await upsertNamedEntity(headers, 'pipelines', pipelineService.fullyQualifiedName, {
+      name: 'test_quality_pipeline',
+      description: 'Test pipeline used to validate impact lineage propagation'
+    });
+    log(`✅ Pipeline: ${testPipeline.name} (${testPipeline.id})`);
+
+    const testDashboard = await upsertNamedEntity(headers, 'dashboards', dashboardService.fullyQualifiedName, {
+      name: 'test_sales_dashboard',
+      description: 'Test dashboard for validating dashboard blast-radius analysis'
+    });
+    log(`✅ Dashboard: ${testDashboard.name} (${testDashboard.id})`);
+
+    const testModel = await upsertNamedEntity(headers, 'mlmodels', mlModelService.fullyQualifiedName, {
+      name: 'test_demand_forecast_model',
+      description: 'Test ML model for downstream impact and risk scoring checks'
+    });
+    log(`✅ ML model: ${testModel.name} (${testModel.id})`);
+
+    // 5. Add cross-asset lineage edges for test validation
+    log('Step 5: Creating cross-asset lineage edges...');
+    const crossEdges = [
+      {
+        fromEntity: { id: tableIds.orders_cleaned, type: 'table' },
+        toEntity: { id: testPipeline.id, type: 'pipeline' },
+        description: 'orders_cleaned -> test_quality_pipeline'
+      },
+      {
+        fromEntity: { id: tableIds.orders_summary, type: 'table' },
+        toEntity: { id: testDashboard.id, type: 'dashboard' },
+        description: 'orders_summary -> test_sales_dashboard'
+      },
+      {
+        fromEntity: { id: tableIds.sales_metrics, type: 'table' },
+        toEntity: { id: testDashboard.id, type: 'dashboard' },
+        description: 'sales_metrics -> test_sales_dashboard'
+      },
+      {
+        fromEntity: { id: tableIds.orders_summary, type: 'table' },
+        toEntity: { id: testModel.id, type: 'mlmodel' },
+        description: 'orders_summary -> test_demand_forecast_model'
+      },
+      {
+        fromEntity: { id: testPipeline.id, type: 'pipeline' },
+        toEntity: { id: testDashboard.id, type: 'dashboard' },
+        description: 'test_quality_pipeline -> test_sales_dashboard'
+      }
+    ];
+
+    for (const edge of crossEdges) {
+      const logLabel = edge.description;
+      await client.put('/api/v1/lineage', { edge }, { headers }).catch((e) => {
+        log(`⚠️ Lineage ${logLabel}: ${e.response?.data?.message || e.message}`);
+      });
+      log(`✅ Lineage: ${logLabel}`);
+      edgeCount++;
+    }
+
+    // 6. Verify
     const verify = await client.get('/api/v1/tables?limit=100', { headers });
     const createdNames = new Set(tables.map(table => table.name));
     const visibleDemoTables = (verify.data.data || []).filter(t => createdNames.has(t.name));
+
+    const [dashboardsRes, pipelinesRes, modelsRes] = await Promise.all([
+      client.get('/api/v1/dashboards?limit=100', { headers }),
+      client.get('/api/v1/pipelines?limit=100', { headers }),
+      client.get('/api/v1/mlmodels?limit=100', { headers })
+    ]);
+
+    const dashboards = dashboardsRes.data?.data || [];
+    const pipelines = pipelinesRes.data?.data || [];
+    const models = modelsRes.data?.data || [];
+    const hasTestDashboard = dashboards.some((d) => d.name === 'test_sales_dashboard');
+    const hasTestPipeline = pipelines.some((p) => p.name === 'test_quality_pipeline');
+    const hasTestModel = models.some((m) => m.name === 'test_demand_forecast_model');
 
     log('');
     log('🎉 INGESTION COMPLETE!');
     log(`📊 Demo tables visible in OpenMetadata: ${visibleDemoTables.length}/${tables.length}`);
     log(`📋 Visible demo tables: ${visibleDemoTables.map(t => t.name).sort().join(', ')}`);
+    log(`📈 Test dashboard present: ${hasTestDashboard ? 'yes' : 'no'}`);
+    log(`⚙️ Test pipeline present: ${hasTestPipeline ? 'yes' : 'no'}`);
+    log(`🤖 Test ML model present: ${hasTestModel ? 'yes' : 'no'}`);
     log(`🔗 Lineage edges created: ${edgeCount}`);
     log('🌐 Verify at: http://localhost:8585');
 

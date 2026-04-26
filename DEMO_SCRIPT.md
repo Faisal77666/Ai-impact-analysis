@@ -134,3 +134,7 @@ With Demo Mode OFF, the system calls real OpenMetadata first. If catalog or line
 - Keep a screenshot of OpenMetadata lineage for the same entities.
 - Keep a screenshot of GitHub Action impact-check output with a sample PR comment.
 - If live API is unavailable, present the screenshots and walk through architecture and request flow.
+
+## Demo Video
+https://youtu.be/aUfCREfMvjo?si=GDZZTCjKwksZ54DX
+
